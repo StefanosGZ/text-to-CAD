@@ -1,78 +1,145 @@
-from typing import List, TypedDict
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
-from langgraph.graph import StateGraph, START, END
+from typing import List, Optional, TypedDict, Union
+from pydantic import BaseModel, ValidationError
+from langgraph.graph import StateGraph, END
+from openai import OpenAI
+import json
+import os
 from dotenv import load_dotenv
-from langchain_core.tools import tool
-from langgraph.prebuilt import ToolNode, tools_condition
 
 load_dotenv()
 
-class AgentState(TypedDict):
-    messages: List[HumanMessage]
+# -------------------------------------
+# 1. SCHEMA (CAD JSON Format)
+# -------------------------------------
+class GraphState(TypedDict):
+    input: str
+    raw_json: Optional[str]
+    cad_json: Optional[dict]
+    error: Optional[str]
+    valid: Optional[bool]
+    note: Optional[str]
 
-# Updated system prompt to require numeric coordinate calculations
-SYSTEM_PROMPT = (
-    "You are a CAD parsing agent. "
-    "Your task is to take the user's natural-language description of a CAD model "
-    "and extract all relevant parameters (shapes, dimensions, positions, features, etc.) into "
-    "a single, well-formed JSON object. "
-    "For every feature’s position, compute and include explicit numeric coordinates (e.g., x, y, z) "
-    "rather than using relative terms like 'center'. "
-    "Respond with JSON only—no extra explanation."
-)
+class BaseShape(BaseModel):
+    type: str
+    dimensions: dict
 
-@tool
-def add(a: float, b: float) :
-    """This is an addition function that adds 2 numbers together"""
-    print("Using add")
-    return a + b
+class Feature(BaseModel):
+    type: str
+    position: Optional[str] = None
+    shape: Optional[str] = None
+    dimensions: Optional[dict] = None
+    diameter: Optional[Union[int, str]] = None
+    location: Optional[str] = None
 
-@tool
-def subtract(a: float, b: float):
-    """This is an addition function that substracts 2 numbers together"""
-    print("Using substract")
-    return a - b
+class CADObject(BaseModel):
+    base_shape: BaseShape
+    features: List[Feature]
 
 
-@tool
-def multiply(a: float, b: float):
-    """This is a multiplication function that multiplies two numbers together"""
-    print("Using multiply")
-    return a * b
+# -------------------------------------
+# 2. LLM PARSING NODE
+# -------------------------------------
 
-@tool
-def divide(a: float, b: float):
-    """This is a dividing function that divides two numbers from eachother"""
-    print("Using divide")
-    return a/b
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-tools = [add, subtract, multiply, divide]
+def llm_parse_node(state):
+    prompt = state["input"]
+    system = """You are a CAD parser. Convert natural language CAD prompts into a JSON structure with the following format.
 
-llm = ChatOpenAI(model="gpt-4o").bind_tools(tools)
+            Use snake_case for all keys. Do not use camelCase.
+            ...
+            
+            Example:
+            {
+              "base_shape": {
+                "type": "square",
+                "dimensions": {
+                  "side_length": "50mm"
+                }
+              },
+              "features": [
+                {
+                  "type": "hole",
+                  "location": "center",
+                  "dimensions": {
+                    "diameter": "2mm"
+                  }
+                }
+              ]
+            }
+            """
+    user_prompt = f"""
+Prompt: {prompt}
 
-def process(state: AgentState) -> AgentState:
-    # Always prepend the system prompt before the user's message
-    msgs = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-    response = llm.invoke(msgs)
-    # Print out the JSON the model returns
-    print(f"\nAI: {response.content}")
-    return state
+Return only valid JSON.
+"""
 
-# Wire up the simple state graph
-tool_node = ToolNode(tools=tools)
-graph = StateGraph(AgentState)
-graph.add_node("process", process)
-graph.add_node("tools", tool_node)
-graph.add_edge(START, "process")
-graph.add_conditional_edges("process", tools_condition)
-graph.add_edge("tools", "process")
-graph.add_edge("process", END)
-agent = graph.compile()
+    response = client.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_prompt}
+        ]
+    )
 
-# Run the REPL
+    output = response.choices[0].message.content
+    return {"raw_json": output.strip()}
+
+# -------------------------------------
+# 3. VALIDATION NODE
+# -------------------------------------
+
+def validate_node(state):
+    try:
+        parsed = json.loads(state["raw_json"])
+        cad_obj = CADObject(**parsed)
+        return {"cad_json": cad_obj.model_dump(), "valid": True}
+    except (json.JSONDecodeError, ValidationError) as e:
+        return {"error": str(e), "valid": False}
+
+# -------------------------------------
+# 4. FALLBACK NODE
+# -------------------------------------
+
+def fallback_node(state):
+    return {
+        "cad_json": None,
+        "note": "Fallback used due to parsing/validation failure.",
+        "error": state.get("error", "Unknown error")
+    }
+
+# -------------------------------------
+# 5. GRAPH DEFINITION
+# -------------------------------------
+
+builder = StateGraph(GraphState)
+
+builder.add_node("parse_prompt", llm_parse_node)
+builder.add_node("validate", validate_node)
+builder.add_node("fallback", fallback_node)
+
+builder.set_entry_point("parse_prompt")
+builder.add_edge("parse_prompt", "validate")
+
+def check_validity(state):
+    return "fallback" if state.get("valid") is False else "end"
+
+builder.add_conditional_edges("validate", check_validity, {
+    "fallback": "fallback",
+    "end": END
+})
+
+graph = builder.compile()
+
+# -------------------------------------
+# 6. RUN THE AGENT
+# -------------------------------------
+
 if __name__ == "__main__":
-    user_input = input("Enter CAD prompt (or 'exit'): ")
-    while user_input.lower() != "exit":
-        agent.invoke({"messages": [HumanMessage(content=user_input)]})
-        user_input = input("Enter CAD prompt (or 'exit'): ")
+    user_input = input("Enter a CAD prompt: ")
+
+    initial_state = {"input": user_input}
+    result = graph.invoke(initial_state)
+
+    print("\n--- PARSING RESULT ---")
+    print(json.dumps(result, indent=2))
