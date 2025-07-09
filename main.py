@@ -195,3 +195,4 @@ if __name__ == "__main__":
 
     print("\n--- PARSING RESULT ---")
     print(json.dumps(result, indent=2))
+    print("MOI")
